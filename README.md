@@ -66,7 +66,7 @@ ln -s "$(pwd)/clearapp.sh" /usr/local/bin/clearapp
 | 태그 | 의미 | 삭제 방식 |
 |------|------|----------|
 | `[app]` | `/Applications` 등에 설치된 일반 macOS 앱(.app) | 본체 + `~/Library` 잔여를 휴지통/sudo rm 으로 정리 |
-| `[cask]` | Homebrew cask 로 설치된 GUI 앱 | `brew uninstall --cask` + `~/Library` 잔여 자동 정리 |
+| `[cask]` | Homebrew cask 로 설치된 GUI 앱 | `brew uninstall --cask` + cask 의 **zap** 메타데이터(작성자 명시 잔여 경로) + `~/Library` 매칭 통합 정리 |
 | `[formula]` | Homebrew formula (CLI 도구) | `brew uninstall` 만 수행 (의존자가 있으면 brew가 거부) |
 
 `-b` 가 켜진 동안에는 `/opt/homebrew/Caskroom`, `/usr/local/Caskroom` 디렉토리의 `.app` 직접 검색은 비활성화되어 cask 항목과 중복되지 않습니다.
@@ -136,8 +136,8 @@ ln -s "$(pwd)/clearapp.sh" /usr/local/bin/clearapp
 2. 번호 또는 fzf로 항목을 선택합니다.
 3. 항목 종류에 따라 분기합니다.
    - `[app]`: `Info.plist` 에서 Bundle ID 추출 → `~/Library`, `/Library` 에서 잔여 수집 → 미리보기 → 휴지통/직접 삭제
-   - `[cask]`: `brew info --cask` 로 .app 이름 추출(가능하면) → 잔여 수집 → 미리보기 → `brew uninstall --cask` + 잔여 정리
-   - `[formula]`: 의존자 안내 → 미리보기 → `brew uninstall`
+   - `[cask]`: `brew info --json=v2` 로 `.app` 이름과 `zap` 메타데이터 파싱 → zap 경로 + Bundle ID/이름 매칭 통합 → 실재 검사 → 미리보기 → `brew uninstall --cask` (실패해도 잔여 정리는 계속) + 잔여 정리
+   - `[formula]`: 의존자 안내(잘리면 "외 N개" 표시) → 미리보기 → `brew uninstall`
 
 ## 라이선스
 

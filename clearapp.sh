@@ -516,9 +516,60 @@ except Exception:
 }
 
 # ─────────────────────────────────────────────────────────────
+# 유틸: brew cask 의 zap 정보 추출
+#   artifacts[].zap[].trash, .delete 배열을 파싱
+#   ~/ 는 $HOME 으로 expand 처리됨
+#   출력 형식: "<action>\t<absolute_path>" (action: trash|delete)
+#   jq → python3 → (없으면 빈 출력)
+# ─────────────────────────────────────────────────────────────
+get_cask_zap() {
+    local cask="$1"
+    command -v brew &>/dev/null || return 1
+
+    local json
+    json=$(brew info --json=v2 --cask "$cask" 2>/dev/null) || return 1
+    [[ -z "$json" ]] && return 1
+
+    if command -v jq &>/dev/null; then
+        printf '%s' "$json" | jq -r --arg home "$HOME" '
+            .casks[0].artifacts[]?
+            | objects
+            | .zap[]?
+            | objects
+            | (.trash[]?  // empty | "trash\t"  + (sub("^~"; $home))),
+              (.delete[]? // empty | "delete\t" + (sub("^~"; $home)))
+        ' 2>/dev/null
+        return
+    fi
+
+    if command -v python3 &>/dev/null; then
+        printf '%s' "$json" | python3 -c '
+import sys, json, os
+try:
+    data = json.load(sys.stdin)
+    casks = data.get("casks", [])
+    if casks:
+        for art in casks[0].get("artifacts", []) or []:
+            if isinstance(art, dict):
+                for zap in art.get("zap", []) or []:
+                    if isinstance(zap, dict):
+                        for action in ("trash", "delete"):
+                            for p in zap.get(action, []) or []:
+                                if isinstance(p, str):
+                                    print(f"{action}\t{os.path.expanduser(p)}")
+except Exception:
+    pass
+' 2>/dev/null
+        return
+    fi
+
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────
 # 처리: brew cask
 #   - brew uninstall --cask 로 본체+brew 메타데이터 정리
-#   - 추가로 ~/Library 잔여를 (가능하면) 함께 정리
+#   - cask zap 정보(작성자 명시 경로) + Bundle ID/이름 기반 매칭을 통합
 #   - brew uninstall 실패해도 잔여 파일 정리는 계속 진행
 # ─────────────────────────────────────────────────────────────
 handle_cask() {
@@ -529,7 +580,7 @@ handle_cask() {
         exit 1
     fi
 
-    # JSON 으로 cask 의 .app 파일명들 모두 추출 (artifacts[].app[])
+    # 1) JSON 으로 .app 파일명 추출
     local -a app_filenames=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && app_filenames+=("$line")
@@ -545,6 +596,32 @@ handle_cask() {
         [[ -n "$app_path" ]] && bundle_id=$(get_bundle_id "$app_path")
     fi
 
+    # 2) zap 정보 (cask 작성자가 명시한 정확한 잔여 경로)
+    local -a zap_paths=()
+    local _action _path
+    while IFS=$'\t' read -r _action _path; do
+        [[ -n "$_path" ]] && zap_paths+=("$_path")
+    done < <(get_cask_zap "$cask")
+
+    # 3) Bundle ID/앱 이름 기반 매칭 (zap 누락 보완)
+    local -a matched=()
+    if [[ -n "$app_name" ]] || [[ -n "$bundle_id" ]]; then
+        local f
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && matched+=("$f")
+        done < <(find_related "${app_name:-}" "${bundle_id:-}")
+    fi
+
+    # 4) 합치고 unique + 실재 검사
+    local -a targets=()
+    local seen
+    while IFS= read -r seen; do
+        [[ -n "$seen" && -e "$seen" ]] && targets+=("$seen")
+    done < <({
+        (( ${#zap_paths[@]} > 0 )) && printf '%s\n' "${zap_paths[@]}"
+        (( ${#matched[@]}   > 0 )) && printf '%s\n' "${matched[@]}"
+    } | awk '!x[$0]++')
+
     echo ""
     echo -e "${BOLD}선택한 Cask${NC}"
     echo -e "  이름      : ${CYAN}$cask${NC}"
@@ -553,18 +630,11 @@ handle_cask() {
     if (( ${#app_filenames[@]} > 1 )); then
         echo -e "  추가 .app : ${app_filenames[*]:1}"
     fi
-    echo ""
-
-    # ~/Library, /Library 잔여 검색 (앱 이름/Bundle ID 둘 다 있을 때만 의미 있음)
-    local -a targets=()
-    if [[ -n "$app_name" ]] || [[ -n "$bundle_id" ]]; then
-        echo -e "${BOLD}관련 파일 검색 중...${NC}"
-        while IFS= read -r f; do
-            [[ -n "$f" ]] && targets+=("$f")
-        done < <(find_related "${app_name:-}" "${bundle_id:-}")
+    if (( ${#zap_paths[@]} > 0 )); then
+        echo -e "  zap 항목  : ${#zap_paths[@]}개 ${DIM}(cask 작성자 명시)${NC}"
     fi
-
     echo ""
+
     echo -e "${BOLD}${YELLOW}수행할 작업${NC}"
     echo -e "  1) ${CYAN}brew uninstall --cask $cask${NC}"
     if (( ${#targets[@]} > 0 )); then
@@ -577,7 +647,7 @@ handle_cask() {
             printf "     ${owner}%-8s %s\n" "${size_str:-?}" "$t"
         done
     else
-        echo -e "  ${DIM}(추가 잔여 파일 없음 또는 자동 매칭 불가)${NC}"
+        echo -e "  ${DIM}(추가 잔여 파일 없음)${NC}"
     fi
     echo ""
 
