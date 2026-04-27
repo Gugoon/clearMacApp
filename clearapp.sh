@@ -474,9 +474,52 @@ handle_app() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# 유틸: brew cask 의 .app 이름들 추출
+#   brew info --json=v2 --cask <name> 의 artifacts[].app[] 배열 파싱
+#   jq → python3 → grep 순으로 fallback
+#   출력: 한 줄에 하나씩, ".app" 확장자 포함 (예: "Stats.app")
+# ─────────────────────────────────────────────────────────────
+get_cask_apps() {
+    local cask="$1"
+    command -v brew &>/dev/null || return 1
+
+    local json
+    json=$(brew info --json=v2 --cask "$cask" 2>/dev/null) || return 1
+    [[ -z "$json" ]] && return 1
+
+    if command -v jq &>/dev/null; then
+        printf '%s' "$json" \
+            | jq -r '.casks[0].artifacts[]? | objects | .app[]? // empty' 2>/dev/null
+        return
+    fi
+
+    if command -v python3 &>/dev/null; then
+        printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    casks = data.get("casks", [])
+    if casks:
+        for art in casks[0].get("artifacts", []) or []:
+            if isinstance(art, dict):
+                for app in art.get("app", []) or []:
+                    if isinstance(app, str):
+                        print(app)
+except Exception:
+    pass
+' 2>/dev/null
+        return
+    fi
+
+    # 최후 fallback: JSON 큰따옴표 사이의 *.app 이름 추출
+    printf '%s' "$json" | grep -oE '"[^"]+\.app"' | sed 's/"//g' | sort -u
+}
+
+# ─────────────────────────────────────────────────────────────
 # 처리: brew cask
 #   - brew uninstall --cask 로 본체+brew 메타데이터 정리
 #   - 추가로 ~/Library 잔여를 (가능하면) 함께 정리
+#   - brew uninstall 실패해도 잔여 파일 정리는 계속 진행
 # ─────────────────────────────────────────────────────────────
 handle_cask() {
     local cask="$1"
@@ -486,15 +529,17 @@ handle_cask() {
         exit 1
     fi
 
-    # brew info 출력에서 .app 이름 추출 (가능한 경우)
-    local app_name="" bundle_id="" app_path=""
-    app_name=$(brew info --cask "$cask" 2>/dev/null \
-        | grep -oE '[A-Za-z0-9._ -]+\.app' | head -1 \
-        | sed 's/\.app$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    # JSON 으로 cask 의 .app 파일명들 모두 추출 (artifacts[].app[])
+    local -a app_filenames=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && app_filenames+=("$line")
+    done < <(get_cask_apps "$cask")
 
-    if [[ -n "$app_name" ]]; then
+    local app_name="" bundle_id="" app_path=""
+    if (( ${#app_filenames[@]} > 0 )); then
+        app_name="${app_filenames[0]%.app}"
         local p
-        for p in "/Applications/${app_name}.app" "$HOME/Applications/${app_name}.app"; do
+        for p in "/Applications/${app_filenames[0]}" "$HOME/Applications/${app_filenames[0]}"; do
             [[ -d "$p" ]] && app_path="$p" && break
         done
         [[ -n "$app_path" ]] && bundle_id=$(get_bundle_id "$app_path")
@@ -505,6 +550,9 @@ handle_cask() {
     echo -e "  이름      : ${CYAN}$cask${NC}"
     [[ -n "$app_name" ]]  && echo -e "  앱 이름   : $app_name"
     [[ -n "$bundle_id" ]] && echo -e "  Bundle ID : $bundle_id"
+    if (( ${#app_filenames[@]} > 1 )); then
+        echo -e "  추가 .app : ${app_filenames[*]:1}"
+    fi
     echo ""
 
     # ~/Library, /Library 잔여 검색 (앱 이름/Bundle ID 둘 다 있을 때만 의미 있음)
@@ -546,13 +594,15 @@ handle_cask() {
     echo ""
     echo -e "${BOLD}진행 중...${NC}"
 
-    # 1) brew uninstall --cask
+    # 1) brew uninstall --cask — 실패해도 잔여 정리는 계속 진행
+    local brew_failed=0
     if (( DRY_RUN )); then
         echo -e "  ${DIM}[dry-run] brew uninstall --cask $cask${NC}"
     else
         if ! brew uninstall --cask "$cask"; then
-            echo -e "${RED}brew uninstall --cask 실패${NC}"
-            return 1
+            echo -e "${YELLOW}  ! brew uninstall --cask 실패 — 이미 제거되었거나 다른 이유일 수 있습니다.${NC}"
+            echo -e "${DIM}  잔여 파일 정리는 계속 진행합니다.${NC}"
+            brew_failed=1
         fi
     fi
 
@@ -571,10 +621,14 @@ handle_cask() {
     echo ""
     if (( DRY_RUN )); then
         echo -e "${YELLOW}DRY-RUN 완료.${NC}"
-    elif (( fail == 0 )); then
+    elif (( brew_failed == 0 )) && (( fail == 0 )); then
         echo -e "${GREEN}${BOLD}✓ Cask '${cask}' 삭제 완료${NC}"
-    else
+    elif (( brew_failed )) && (( fail == 0 )); then
+        echo -e "${YELLOW}brew uninstall 은 실패했지만 잔여 파일 ${#targets[@]}개는 정리되었습니다.${NC}"
+    elif (( brew_failed == 0 )) && (( fail > 0 )); then
         echo -e "${YELLOW}brew uninstall 은 성공, 잔여 파일 ${fail}개 실패${NC}"
+    else
+        echo -e "${RED}brew uninstall 실패 + 잔여 파일 ${fail}개 실패${NC}"
     fi
 }
 
@@ -597,11 +651,15 @@ handle_formula() {
     echo ""
 
     # 의존성 체크 — 안내만, 실제 차단은 brew 가 함
-    local users
-    users=$(brew uses --installed "$formula" 2>/dev/null | head -10)
-    if [[ -n "$users" ]]; then
-        echo -e "${YELLOW}이 패키지에 의존하는 다른 formula:${NC}"
-        printf '%s\n' "$users" | awk '{print "  - " $0}'
+    local users_all users_count
+    users_all=$(brew uses --installed "$formula" 2>/dev/null)
+    users_count=$(printf '%s' "$users_all" | grep -c .)
+    if (( users_count > 0 )); then
+        echo -e "${YELLOW}이 패키지에 의존하는 다른 formula (${users_count}개):${NC}"
+        printf '%s\n' "$users_all" | head -10 | awk '{print "  - " $0}'
+        if (( users_count > 10 )); then
+            echo -e "  ${DIM}... 외 $(( users_count - 10 ))개${NC}"
+        fi
         echo -e "${DIM}(brew는 의존자가 있으면 uninstall 을 거부할 수 있습니다)${NC}"
         echo ""
     fi
