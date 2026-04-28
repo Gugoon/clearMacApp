@@ -204,6 +204,8 @@ trash_or_remove() {
 
     # 위험 경로 가드 — trailing slash 정규화 후 비교
     local normalized="${target%/}"
+
+    # (1) 정확 일치 차단 — 디렉토리 자체는 금지하되 하위는 허용 (스크립트의 본 기능)
     local _forbidden
     for _forbidden in \
         "" "/" \
@@ -215,6 +217,18 @@ trash_or_remove() {
     do
         if [[ "$normalized" == "${_forbidden%/}" ]]; then
             echo -e "  ${RED}✗${NC} 위험 경로 거부: $target" >&2
+            return 1
+        fi
+    done
+
+    # (2) prefix 차단 — 시스템 영역은 자신과 하위 모두 금지
+    #   /usr, /opt 는 brew Caskroom 호환을 위해 정확 일치만 (위에서 처리)
+    local _prefix
+    for _prefix in \
+        "/System/" "/private/" "/bin/" "/sbin/" "/etc/" "/var/"
+    do
+        if [[ "$normalized/" == "$_prefix"* ]]; then
+            echo -e "  ${RED}✗${NC} 시스템 경로 거부: $target" >&2
             return 1
         fi
     done
@@ -388,13 +402,14 @@ select_app() {
         exit 0
     fi
 
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#apps[@]} )); then
+    # 10# 강제로 8진수 해석 방지 (예: "010" → 8 로 해석되는 버그)
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( 10#$choice < 1 || 10#$choice > ${#apps[@]} )); then
         echo -e "${RED}잘못된 선택입니다.${NC}" >&2
         exit 1
     fi
 
     # apps[i] 는 이미 "type\tidentifier" 형식
-    printf '%s\n' "${apps[$((choice-1))]}"
+    printf '%s\n' "${apps[$((10#$choice-1))]}"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -436,10 +451,14 @@ handle_app() {
     echo -e "${BOLD}${YELLOW}삭제 대상 (${#unique_targets[@]}개)${NC}"
     local t
     for t in "${unique_targets[@]}"; do
-        local size_str owner
+        local size_str needs_sudo_disp sudo_label
         size_str=$(du -sh "$t" 2>/dev/null | awk '{print $1}')
-        owner=$([[ "$t" =~ ^(/Library|/Applications)(/|$) ]] && echo "${YELLOW}[sudo]${NC} " || echo "")
-        printf "  ${owner}%-8s %s\n" "${size_str:-?}" "$t"
+        needs_sudo_disp=0
+        [[ "$t" =~ ^(/Library|/Applications)(/|$) ]] && needs_sudo_disp=1
+        (( needs_sudo_disp )) && [[ -O "$t" ]] && needs_sudo_disp=0
+        sudo_label=""
+        (( needs_sudo_disp )) && sudo_label="${YELLOW}[sudo]${NC} "
+        printf "  ${sudo_label}%-8s %s\n" "${size_str:-?}" "$t"
     done
     echo ""
 
@@ -460,7 +479,7 @@ handle_app() {
         local needs_sudo=0
         [[ "$t" =~ ^(/Library|/Applications)(/|$) ]] && needs_sudo=1
         (( needs_sudo )) && [[ -O "$t" ]] && needs_sudo=0
-        trash_or_remove "$t" "$needs_sudo" || ((fail++))
+        trash_or_remove "$t" "$needs_sudo" || ((fail += 1))
     done
 
     echo ""
@@ -554,7 +573,14 @@ try:
                 for zap in art.get("zap", []) or []:
                     if isinstance(zap, dict):
                         for action in ("trash", "delete"):
-                            for p in zap.get(action, []) or []:
+                            val = zap.get(action)
+                            if isinstance(val, str):
+                                paths = [val]
+                            elif isinstance(val, list):
+                                paths = val
+                            else:
+                                paths = []
+                            for p in paths:
                                 if isinstance(p, str):
                                     print(f"{action}\t{os.path.expanduser(p)}")
 except Exception:
@@ -641,10 +667,14 @@ handle_cask() {
         echo -e "  2) 잔여 파일 ${#targets[@]}개 삭제:"
         local t
         for t in "${targets[@]}"; do
-            local size_str owner
+            local size_str needs_sudo_disp sudo_label
             size_str=$(du -sh "$t" 2>/dev/null | awk '{print $1}')
-            owner=$([[ "$t" =~ ^/Library(/|$) ]] && echo "${YELLOW}[sudo]${NC} " || echo "")
-            printf "     ${owner}%-8s %s\n" "${size_str:-?}" "$t"
+            needs_sudo_disp=0
+            [[ "$t" =~ ^/Library(/|$) ]] && needs_sudo_disp=1
+            (( needs_sudo_disp )) && [[ -O "$t" ]] && needs_sudo_disp=0
+            sudo_label=""
+            (( needs_sudo_disp )) && sudo_label="${YELLOW}[sudo]${NC} "
+            printf "     ${sudo_label}%-8s %s\n" "${size_str:-?}" "$t"
         done
     else
         echo -e "  ${DIM}(추가 잔여 파일 없음)${NC}"
@@ -684,7 +714,7 @@ handle_cask() {
             local needs_sudo=0
             [[ "$t" =~ ^/Library(/|$) ]] && needs_sudo=1
             (( needs_sudo )) && [[ -O "$t" ]] && needs_sudo=0
-            trash_or_remove "$t" "$needs_sudo" || ((fail++))
+            trash_or_remove "$t" "$needs_sudo" || ((fail += 1))
         done
     fi
 
