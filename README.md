@@ -113,6 +113,8 @@ ln -s "$(pwd)/clearapp.sh" /usr/local/bin/clearapp
 - `~/Library/WebKit`
 - `~/Library/Cookies`
 - `~/Library/LaunchAgents`
+- `~/Library/Application Scripts`
+- `~/Library/Preferences/ByHost` (`<bundle_id>.<하드웨어 UUID>.plist` 형태만)
 
 시스템 영역 (sudo로 직접 삭제):
 
@@ -127,6 +129,11 @@ ln -s "$(pwd)/clearapp.sh" /usr/local/bin/clearapp
 
 - 기본 동작은 확인 프롬프트가 필요한 대화형 모드입니다.
 - 사용자 영역은 곧장 지우지 않고 휴지통으로 이동시켜 복구할 수 있습니다. (cask `zap` 의 `delete` 로 명시된 항목만 작성자 의도대로 직접 삭제)
+  - macOS 15+ 내장 `/usr/bin/trash` 를 우선 사용하므로 Finder 자동화 권한이 없어도 휴지통 이동이 됩니다. 그 외에는 Finder(osascript)로 시도하며, 둘 다 실패해 영구 삭제로 넘어간 경우 결과에 `(휴지통 이동 실패 → 영구 삭제)` 로 명확히 표시합니다.
+  - 심볼릭 링크는 링크 자체만 제거하고 원본은 건드리지 않습니다(Finder 의 alias 변환은 원본을 따라가므로 링크에는 사용하지 않음).
+- sudo 필요 여부는 항목 소유자뿐 아니라 **부모 디렉토리 쓰기 권한**까지 보고 판정합니다(내 소유 파일이라도 root 소유 폴더 안에 있으면 sudo).
+- LaunchAgents/LaunchDaemons 의 plist 는 삭제 전에 `launchctl bootout` 으로 로드된 작업을 내려, 재부팅 전까지 백그라운드에서 계속 도는 일을 막습니다.
+- 선택한 앱이 실행 중이면 삭제 전에 경고합니다.
 - Bundle ID 매칭은 정확 일치 + 알려진 확장자(`.plist`/`.savedState`/`.binarycookies`)만 허용해 `com.foo.bar.helper` 같은 형제 식별자 오탐을 막습니다. 앱 이름 매칭은 glob 해석 없이 basename 정확 비교(대소문자 무시)로 수행하며, 시스템 영역에서는 적용하지 않아 공통 단어 오탐을 줄입니다. Group Containers 의 `<TeamID>.<bundle_id>` 형태도 함께 매칭합니다.
 - 삭제 경로는 연속 슬래시(`//`)·상위경로(`..`)를 정규화한 뒤 검사하며, `/`, `/Library`, `/Applications`, `$HOME`, `$HOME/Library`, `$HOME/Documents` 등 시스템·홈 디렉토리 자체와 `/System`·`/usr`·`/etc` 등 시스템 영역, 그리고 `~/.ssh`·`~/.gnupg`·`~/.aws`·`~/.config`·`~/Library/Keychains` 같은 민감 경로에 대한 삭제는 자동 차단됩니다(Homebrew Caskroom 하위는 예외 허용).
 - 잔여 파일 경로는 절대경로·실재 여부를 검증한 뒤에만 삭제 대상에 포함합니다(깨진 심볼릭 링크는 잔여물로 간주해 함께 정리). 앱 목록의 `.app` 탐색에서는 깨진 심볼릭 링크 번들이 자동 제외됩니다.

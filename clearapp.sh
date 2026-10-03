@@ -74,7 +74,8 @@ ${BOLD}앱 탐색 위치:${NC}
 ${BOLD}삭제 대상 (관련 파일) 위치:${NC}
   ~/Library/{Application Support,Caches,Preferences,Logs,
             Saved Application State,Containers,Group Containers,
-            HTTPStorages,WebKit,Cookies,LaunchAgents}
+            HTTPStorages,WebKit,Cookies,LaunchAgents,
+            Application Scripts,Preferences/ByHost}
   /Library/{Application Support,Caches,Preferences,
            LaunchAgents,LaunchDaemons,PrivilegedHelperTools}
 EOF
@@ -124,6 +125,8 @@ USER_LOCATIONS=(
     "$HOME/Library/WebKit"
     "$HOME/Library/Cookies"
     "$HOME/Library/LaunchAgents"
+    "$HOME/Library/Application Scripts"
+    "$HOME/Library/Preferences/ByHost"
 )
 
 SYSTEM_LOCATIONS=(
@@ -166,6 +169,66 @@ du_safe() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# 유틸: 삭제에 sudo 가 필요한지 판정 (0=필요, 1=불필요)
+#   - /Library, /Applications 하위만 대상
+#   - 항목을 지우려면 "부모 디렉토리 쓰기 권한"이 필요하므로 이를 먼저 본다
+#     (내 소유 파일이라도 root 소유 /Library/Application Support 안에 있으면 sudo 필요)
+#   - 심볼릭 링크는 링크만 지우므로 부모 권한만 확인 (-O 는 링크를 따라감)
+# ─────────────────────────────────────────────────────────────
+needs_sudo_for() {
+    local t="$1"
+    [[ "$t" =~ ^(/Library|/Applications)(/|$) ]] || return 1
+    local parent="${t%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    [[ -w "$parent" ]] || return 0
+    [[ -L "$t" ]] && return 1
+    [[ -O "$t" ]] && return 1
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────
+# 유틸: LaunchAgents/LaunchDaemons plist 라면 로드된 작업을 내린다 (best-effort)
+#   - plist 만 지우면 이미 로드된 에이전트/데몬은 재부팅 전까지 계속 실행된다
+#   - 로드되어 있지 않으면 launchctl 이 실패하지만 무시한다
+# ─────────────────────────────────────────────────────────────
+unload_launchd_job() {
+    local p="$1" domain="" use_sudo=0
+    case "$p" in
+        "$HOME"/Library/LaunchAgents/*.plist|/Library/LaunchAgents/*.plist)
+            domain="gui/$(id -u)" ;;
+        /Library/LaunchDaemons/*.plist)
+            domain="system"; use_sudo=1 ;;
+        *) return 0 ;;
+    esac
+    [[ -f "$p" && ! -L "$p" ]] || return 0
+    command -v launchctl &>/dev/null || return 0
+
+    if (( DRY_RUN )); then
+        printf '  %s[dry-run] launchctl bootout %s %s%s\n' "$DIM" "$domain" "$p" "$NC"
+        return 0
+    fi
+    if (( use_sudo )); then
+        sudo launchctl bootout "$domain" "$p" &>/dev/null || true
+    else
+        launchctl bootout "$domain" "$p" &>/dev/null || true
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# 유틸: 앱 번들이 실행 중이면 경고 (차단하지는 않음)
+#   - 실행 중에 지우면 앱이 잔여 파일을 다시 만들거나 비정상 종료될 수 있다
+#   - pgrep -f 는 정규식이라 경로 특수문자에 취약하므로 ps + grep -F 로 비교
+# ─────────────────────────────────────────────────────────────
+warn_if_running() {
+    local app_path="$1"
+    [[ -n "$app_path" ]] || return 0
+    # shellcheck disable=SC2009  # 의도적: pgrep -f 의 정규식 해석을 피하려고 grep -F 사용
+    if ps -axo comm= 2>/dev/null | grep -qF -- "$app_path/Contents/"; then
+        printf '%s※ 이 앱이 현재 실행 중입니다. 삭제 전에 종료하는 것을 권장합니다.%s\n' "$YELLOW" "$NC" >&2
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
 # 유틸: 사용자 입력 받기
 #   - prompt 는 stderr 로 출력해서 stdout 캡쳐에 섞이지 않게 함
 # ─────────────────────────────────────────────────────────────
@@ -201,15 +264,15 @@ list_apps() {
         for root in "${roots[@]}"; do
             [[ -d "$root" ]] || continue
             while IFS= read -r -d '' p; do
-                case "$p" in *$'\n'*) continue ;; esac   # 개행 포함 경로 제외
+                case "$p" in *$'\n'*|*$'\t'*) continue ;; esac   # 개행/탭 포함 경로 제외(목록 구분자)
                 printf 'app\t%s\n' "$p"
-            done < <(find -L "$root" -maxdepth 4 -name "*.app" -type d -not -path "*/Contents/*" -print0 2>/dev/null)
+            done < <(find -L "$root" -maxdepth 4 -name "*.app" -type d -not -path "*/Contents/*" -print0 -prune 2>/dev/null)
         done
 
         # --all: Spotlight 인덱스 (NUL 구분으로 안전 처리)
         if (( include_all )) && command -v mdfind &>/dev/null; then
             while IFS= read -r -d '' p; do
-                case "$p" in *$'\n'*) continue ;; esac
+                case "$p" in *$'\n'*|*$'\t'*) continue ;; esac
                 case "$p" in
                     */Contents/*)                       continue ;;
                     /System/*)                          continue ;;
@@ -323,13 +386,33 @@ trash_or_remove() {
     done
 
     if (( DRY_RUN )); then
+        unload_launchd_job "$normalized"
         printf '  %s[dry-run] 삭제 예정: %s%s\n' "$DIM" "$target" "$NC"
         return 0
     fi
 
-    # 사용자 영역 + trash 액션이면 osascript 로 휴지통 이동 (argv 전달 — injection 방지)
-    if [[ "$action" != "delete" ]] && (( needs_sudo == 0 )) && command -v osascript &>/dev/null; then
-        if osascript - "$target" <<'APPLESCRIPT' &>/dev/null
+    # 수집 이후 사라진 항목(brew uninstall 이 먼저 지운 경우 등)은 성공으로 간주
+    if [[ ! -e "$target" && ! -L "$target" ]]; then
+        printf '  %s-%s 이미 없음: %s\n' "$DIM" "$NC" "$target"
+        return 0
+    fi
+
+    # 로드된 launchd 작업은 plist 를 지우기 전에 내린다 (재부팅 전까지 계속 실행되는 것 방지)
+    unload_launchd_job "$normalized"
+
+    # 사용자 영역 + trash 액션이면 휴지통 이동 시도
+    local trash_tried=0
+    if [[ "$action" != "delete" ]] && (( needs_sudo == 0 )); then
+        trash_tried=1
+        # (a) macOS 15+ 내장 trash — Finder 자동화 권한 불필요, 심볼릭 링크는 링크 자체만 이동
+        if [[ -x /usr/bin/trash ]] && /usr/bin/trash "$target" &>/dev/null; then
+            printf '  %s✓%s 휴지통으로 이동: %s\n' "$GREEN" "$NC" "$target"
+            return 0
+        fi
+        # (b) Finder (argv 전달 — injection 방지).
+        #     'as alias' 는 심볼릭 링크를 따라가 원본을 휴지통에 넣으므로 링크에는 쓰지 않는다.
+        if [[ ! -L "$target" ]] && command -v osascript &>/dev/null \
+            && osascript - "$target" <<'APPLESCRIPT' &>/dev/null
 on run argv
     set p to item 1 of argv
     tell application "Finder" to delete (POSIX file p as alias)
@@ -341,7 +424,8 @@ APPLESCRIPT
         fi
     fi
 
-    # 시스템 영역 / delete 액션 / osascript 실패 시 직접 삭제 (eval 없이)
+    # 시스템 영역 / delete 액션 / 휴지통 이동 실패 시 직접 삭제 (eval 없이)
+    #   심볼릭 링크는 rm 이 링크 자체만 지운다(원본 보존).
     local rc=0
     if (( needs_sudo )); then
         sudo rm -rf -- "$target" || rc=$?
@@ -350,7 +434,11 @@ APPLESCRIPT
     fi
 
     if (( rc == 0 )); then
-        printf '  %s✓%s 삭제됨: %s\n' "$GREEN" "$NC" "$target"
+        if (( trash_tried )); then
+            printf '  %s✓%s 삭제됨 %s(휴지통 이동 실패 → 영구 삭제)%s: %s\n' "$GREEN" "$NC" "$YELLOW" "$NC" "$target"
+        else
+            printf '  %s✓%s 삭제됨: %s\n' "$GREEN" "$NC" "$target"
+        fi
         return 0
     else
         printf '  %s✗%s 실패: %s\n' "$RED" "$NC" "$target" >&2
@@ -388,6 +476,14 @@ find_related() {
 
             # Group Containers 등은 <TeamID>.<bundle_id> 형태
             case "$loc" in
+                */Preferences/ByHost)
+                    # <bundle_id>.<하드웨어 UUID>.plist — UUID 형태만 허용해 형제 식별자 오탐 방지
+                    while IFS= read -r -d '' f; do
+                        results+=("$f")
+                    done < <(find "$loc" -maxdepth 1 \
+                        -name "${bundle_id}.????????-????-????-????-????????????.plist" \
+                        -print0 2>/dev/null)
+                    ;;
                 */Group\ Containers|*/HTTPStorages)
                     while IFS= read -r -d '' f; do
                         results+=("$f")
@@ -576,7 +672,12 @@ handle_app() {
     else
         printf '  Bundle ID : %s(읽을 수 없음)%s\n' "$DIM" "$NC"
     fi
+    if [[ -L "$app_path" ]]; then
+        printf '  %s(심볼릭 링크 → %s : 링크만 제거되고 원본은 남습니다)%s\n' \
+            "$DIM" "$(readlink "$app_path")" "$NC"
+    fi
     echo ""
+    warn_if_running "$app_path"
 
     printf '%s관련 파일 검색 중...%s\n' "$BOLD" "$NC"
     local -a targets=("$app_path")
@@ -604,8 +705,7 @@ handle_app() {
     for t in "${unique_targets[@]+"${unique_targets[@]}"}"; do
         size_str=$(du_safe "$t")
         needs_sudo_disp=0
-        [[ "$t" =~ ^(/Library|/Applications)(/|$) ]] && needs_sudo_disp=1
-        (( needs_sudo_disp )) && [[ -O "$t" ]] && needs_sudo_disp=0
+        needs_sudo_for "$t" && needs_sudo_disp=1
         if (( needs_sudo_disp )); then
             printf '  %s[sudo]%s %-8s %s\n' "$YELLOW" "$NC" "${size_str:-?}" "$t"
         else
@@ -629,8 +729,7 @@ handle_app() {
     local fail=0 needs_sudo
     for t in "${unique_targets[@]+"${unique_targets[@]}"}"; do
         needs_sudo=0
-        [[ "$t" =~ ^(/Library|/Applications)(/|$) ]] && needs_sudo=1
-        (( needs_sudo )) && [[ -O "$t" ]] && needs_sudo=0
+        needs_sudo_for "$t" && needs_sudo=1
         trash_or_remove "$t" "$needs_sudo" "trash" || ((fail += 1))
     done
 
@@ -810,7 +909,7 @@ handle_cask() {
     done < <(get_cask_apps "$json")
     if (( ${#app_filenames[@]} > 0 )); then
         local -a _uniq=()
-        local a ex
+        local a ex u
         for a in "${app_filenames[@]}"; do
             ex=0
             for u in "${_uniq[@]+"${_uniq[@]}"}"; do [[ "$u" == "$a" ]] && { ex=1; break; }; done
@@ -890,6 +989,7 @@ handle_cask() {
     local zc=$(( ${#zap_trash[@]} + ${#zap_delete[@]} ))
     (( zc > 0 )) && printf '  zap 항목  : %s개 %s(cask 작성자 명시)%s\n' "$zc" "$DIM" "$NC"
     echo ""
+    warn_if_running "$app_path"
 
     printf '%s%s수행할 작업%s\n' "$BOLD" "$YELLOW" "$NC"
     printf '  1) %sbrew uninstall --cask %s%s\n' "$CYAN" "$cask" "$NC"
@@ -900,8 +1000,7 @@ handle_cask() {
             t="${tpaths[$i]}"; act="${tactions[$i]}"
             size_str=$(du_safe "$t")
             needs_sudo_disp=0
-            [[ "$t" =~ ^(/Library|/Applications)(/|$) ]] && needs_sudo_disp=1
-            (( needs_sudo_disp )) && [[ -O "$t" ]] && needs_sudo_disp=0
+            needs_sudo_for "$t" && needs_sudo_disp=1
             if (( needs_sudo_disp )); then
                 printf '     %s[sudo]%s %-8s %s\n' "$YELLOW" "$NC" "${size_str:-?}" "$t"
             elif [[ "$act" == "delete" ]]; then
@@ -947,8 +1046,7 @@ handle_cask() {
         for i in "${!tpaths[@]}"; do
             t="${tpaths[$i]}"; act="${tactions[$i]}"
             needs_sudo=0
-            [[ "$t" =~ ^(/Library|/Applications)(/|$) ]] && needs_sudo=1
-            (( needs_sudo )) && [[ -O "$t" ]] && needs_sudo=0
+            needs_sudo_for "$t" && needs_sudo=1
             trash_or_remove "$t" "$needs_sudo" "$act" || ((fail += 1))
         done
     fi
